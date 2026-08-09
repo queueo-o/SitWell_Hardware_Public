@@ -1,16 +1,21 @@
 # Posture Checker - CircuitPython
 # Hardware: Adafruit ESP32-S3 Feather (8MB Flash, No PSRAM)
 # Sensors:  FSR on A0-A5 (circle, square, and velostat compatible)
+# Haptic:   Adafruit DRV2605L + mini vibrating disc motor, over STEMMA QT
 # BLE:      Adafruit Bluefruit Connect app (UART mode)
 #
 # Wiring:
 #   FSR1-4: one leg → 3.3V, other leg → A0-A3; 10K pulldown from pin → GND
 #   FSR5-6: velostat — one leg → 3.3V, other leg → A4-A5; 10K pulldown from pin → GND
+#   DRV2605L: STEMMA QT cable from the Feather's STEMMA port to the DRV2605L
+#   Motor:    disc motor's two wires into the DRV2605L screw terminals
 #
 # Required libraries in /lib:
 #   adafruit_ble/
 #   adafruit_bluefruit_connect/
 #   neopixel.mpy
+#   adafruit_drv2605.mpy      (optional - haptics are skipped if missing)
+#   adafruit_bus_device/      (needed by adafruit_drv2605)
 
 import time
 import math
@@ -20,6 +25,13 @@ import neopixel
 import adafruit_ble
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
 from adafruit_ble.services.nordic import UARTService
+
+# Haptic library is optional so the checker still boots without it installed.
+try:
+    import adafruit_drv2605
+    _DRV_LIB = True
+except ImportError:
+    _DRV_LIB = False
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SENSOR CONFIGURATION  —  edit this section to tune your setup
@@ -41,14 +53,21 @@ SENSOR_TYPE = {
     "fsr6": "velostat_back",
 }
 
-MIN_BASELINE = 10
+MIN_BASELINE          = 10
+CALIBRATION_MIN_VALID = 50   # baselines below this mean bad sensor contact
 
 DEVIATION = {
     "circle":        0.5,
     "square":        0.6,
-    "velostat_seat": 0.10,
-    "velostat_back": 0.20,
+    "velostat_seat": 0.25,
+    "velostat_back": 0.25,
 }
+
+INCREASE_TOLERANCE = 1.5   # increased pressure gets 50% more headroom than decreased
+
+# ── Haptic feedback ──────────────────────────────────────────────────────────
+HAPTIC_STRENGTH = 0x7F   # 0x00-0x7F, drive level while buzzing
+HAPTIC_ON_TIME  = 0.4    # seconds of buzz at the start of each pulse cycle
 
 CIRCLE_THRESHOLDS = [
     (15,  "No contact"),
@@ -110,6 +129,25 @@ advertisement = ProvideServicesAdvertisement(uart)
 
 pixel = neopixel.NeoPixel(board.NEOPIXEL, 1, brightness=1.0, auto_write=True)
 
+# ── Haptic driver over STEMMA QT ─────────────────────────────────────────────
+# Realtime mode lets us set the drive level directly, so buzzing is
+# non-blocking and can be held on for as long as we want.
+drv = None
+HAPTIC_OK = False
+
+if _DRV_LIB:
+    try:
+        i2c = board.STEMMA_I2C()
+        drv = adafruit_drv2605.DRV2605(i2c)
+        drv.mode = adafruit_drv2605.MODE_REALTIME
+        drv.realtime_value = 0
+        HAPTIC_OK = True
+        print("DRV2605L found.")
+    except Exception as e:
+        print("DRV2605L not responding, continuing without haptics:", e)
+else:
+    print("adafruit_drv2605 not installed, continuing without haptics.")
+
 COLOR_OFF         = (0,   0,   0)
 COLOR_GOOD        = (0,   20,  0)
 COLOR_ALERT       = (255, 0,   0)
@@ -146,6 +184,19 @@ def led_off():
     pixel[0] = COLOR_OFF
 
 
+def haptic_tick():
+    """Pulse the motor in time with the LED. Call every loop while alerting."""
+    if not HAPTIC_OK:
+        return
+    phase = (time.monotonic() - _pulse_start) % PULSE_PERIOD
+    drv.realtime_value = HAPTIC_STRENGTH if phase < HAPTIC_ON_TIME else 0
+
+
+def haptic_off():
+    if HAPTIC_OK:
+        drv.realtime_value = 0
+
+
 def get_reading(pin):
     return min(1023, int((pin.value >> 6) * SCALE))
 
@@ -171,6 +222,7 @@ def run_calibration(uart_svc):
     uart_println(uart_svc, "")
 
     led_calibrating()
+    haptic_off()
 
     sum1 = sum2 = sum3 = sum4 = sum5 = sum6 = 0
 
@@ -196,6 +248,35 @@ def run_calibration(uart_svc):
     baseline5 = sum5 / CALIBRATION_SAMPLES
     baseline6 = sum6 / CALIBRATION_SAMPLES
 
+    baselines = [
+        ("FSR1", baseline1, SENSOR_TYPE["fsr1"]),
+        ("FSR2", baseline2, SENSOR_TYPE["fsr2"]),
+        ("FSR3", baseline3, SENSOR_TYPE["fsr3"]),
+        ("FSR4", baseline4, SENSOR_TYPE["fsr4"]),
+        ("FSR5", baseline5, SENSOR_TYPE["fsr5"]),
+        ("FSR6", baseline6, SENSOR_TYPE["fsr6"]),
+    ]
+
+    # ── Validate before accepting ────────────────────────────────────────────
+    bad = [(n, b) for n, b, _ in baselines if b < CALIBRATION_MIN_VALID]
+
+    if bad:
+        uart_println(uart_svc, "")
+        uart_println(uart_svc, "=== CALIBRATION ERROR ===")
+        uart_println(uart_svc, f"These sensors read below {CALIBRATION_MIN_VALID}:")
+        for n, b in bad:
+            uart_println(uart_svc, f"  ✗ {n} : {b:.1f}")
+        uart_println(uart_svc, "")
+        uart_println(uart_svc, "Check that the sensors are seated properly and that")
+        uart_println(uart_svc, "you are sitting fully against the chair, then send 'c'")
+        uart_println(uart_svc, "to calibrate again.")
+        uart_println(uart_svc, "")
+
+        calibration["is_calibrated"] = False
+        led_uncalibrated()
+        return False
+
+    # ── Accept the calibration ───────────────────────────────────────────────
     calibration["fsr1_baseline"] = baseline1
     calibration["fsr2_baseline"] = baseline2
     calibration["fsr3_baseline"] = baseline3
@@ -206,26 +287,19 @@ def run_calibration(uart_svc):
 
     uart_println(uart_svc, "")
     uart_println(uart_svc, "=== CALIBRATION COMPLETE ===")
-    uart_println(uart_svc, f"  FSR1 ({SENSOR_TYPE['fsr1']}) baseline : {baseline1:.1f}  "
-                           f"({pressure_label(int(baseline1), SENSOR_TYPE['fsr1'])})")
-    uart_println(uart_svc, f"  FSR2 ({SENSOR_TYPE['fsr2']}) baseline : {baseline2:.1f}  "
-                           f"({pressure_label(int(baseline2), SENSOR_TYPE['fsr2'])})")
-    uart_println(uart_svc, f"  FSR3 ({SENSOR_TYPE['fsr3']}) baseline : {baseline3:.1f}  "
-                           f"({pressure_label(int(baseline3), SENSOR_TYPE['fsr3'])})")
-    uart_println(uart_svc, f"  FSR4 ({SENSOR_TYPE['fsr4']}) baseline : {baseline4:.1f}  "
-                           f"({pressure_label(int(baseline4), SENSOR_TYPE['fsr4'])})")
-    uart_println(uart_svc, f"  FSR5 ({SENSOR_TYPE['fsr5']}) baseline : {baseline5:.1f}  "
-                           f"({pressure_label(int(baseline5), SENSOR_TYPE['fsr5'])})")
-    uart_println(uart_svc, f"  FSR6 ({SENSOR_TYPE['fsr6']}) baseline : {baseline6:.1f}  "
-                           f"({pressure_label(int(baseline6), SENSOR_TYPE['fsr6'])})")
-    uart_println(uart_svc, f"  Thresholds → circle ±{int(DEVIATION['circle']*100)}%  "
-                           f"square ±{int(DEVIATION['square']*100)}%  "
-                           f"velostat_seat ±{int(DEVIATION['velostat_seat']*100)}%  "
-                           f"velostat_back ±{int(DEVIATION['velostat_back']*100)}%")
+    for n, b, stype in baselines:
+        uart_println(uart_svc, f"  {n} ({stype}) baseline : {b:.1f}  "
+                               f"({pressure_label(int(b), stype)})")
+    uart_println(uart_svc, "  Limits (increase / decrease):")
+    for key in ("circle", "square", "velostat_seat", "velostat_back"):
+        d = DEVIATION[key]
+        uart_println(uart_svc, f"    {key}: +{int(d * INCREASE_TOLERANCE * 100)}% / "
+                               f"-{int(d * 100)}%")
     uart_println(uart_svc, "Monitoring will now begin.")
     uart_println(uart_svc, "")
 
     led_good()
+    return True
 
 
 def check_posture(r1, r2, r3, r4, r5, r6):
@@ -244,16 +318,24 @@ def check_posture(r1, r2, r3, r4, r5, r6):
         if baseline is None or baseline < MIN_BASELINE:
             continue
 
-        threshold = DEVIATION[stype]
-        ratio     = reading / baseline
+        threshold  = DEVIATION[stype]
+        up_limit   = threshold * INCREASE_TOLERANCE
+        down_limit = threshold
+        ratio      = reading / baseline
 
-        if ratio > (1 + threshold) or ratio < (1 - threshold):
-            direction = "increased" if reading > baseline else "decreased"
-            pct_off   = int(abs(ratio - 1) * 100)
+        if ratio > (1 + up_limit):
+            pct_off = int(abs(ratio - 1) * 100)
             alerts.append(
-                f"  ⚠ {name} ({stype}) pressure {direction} by {pct_off}%  "
+                f"  ⚠ {name} ({stype}) pressure increased by {pct_off}%  "
                 f"(now {reading}, baseline {baseline:.1f}, "
-                f"limit ±{int(threshold * 100)}%)"
+                f"limit +{int(up_limit * 100)}%)"
+            )
+        elif ratio < (1 - down_limit):
+            pct_off = int(abs(ratio - 1) * 100)
+            alerts.append(
+                f"  ⚠ {name} ({stype}) pressure decreased by {pct_off}%  "
+                f"(now {reading}, baseline {baseline:.1f}, "
+                f"limit -{int(down_limit * 100)}%)"
             )
 
     return alerts
@@ -263,6 +345,7 @@ def check_posture(r1, r2, r3, r4, r5, r6):
 
 print("Posture Checker booting — advertising BLE...")
 led_off()
+haptic_off()
 
 while True:
     ble.start_advertising(advertisement)
@@ -286,6 +369,9 @@ while True:
     uart_println(uart, "  r  or  reset      → clear calibration")
     uart_println(uart, "")
 
+    if not HAPTIC_OK:
+        uart_println(uart, "⚠ Haptic driver not active. Alerts will be LED only.")
+
     if not calibration["is_calibrated"]:
         uart_println(uart, "⚠ Not yet calibrated. Send 'c' to calibrate.")
 
@@ -306,6 +392,7 @@ while True:
                     run_calibration(uart)
                     posture_bad      = False
                     _deviation_start = None
+                    haptic_off()
 
                 elif cmd in ("s", "status"):
                     r1 = get_reading(fsr1)
@@ -349,6 +436,7 @@ while True:
                     calibration["is_calibrated"] = False
                     posture_bad      = False
                     _deviation_start = None
+                    haptic_off()
                     led_uncalibrated()
                     uart_println(uart, "Calibration reset. Send 'c' to recalibrate.")
 
@@ -371,7 +459,7 @@ while True:
 
             if alerts:
                 if _deviation_start is None:
-                    _deviation_start = time.monotonic()  # start sustain timer
+                    _deviation_start = time.monotonic()
                 elif time.monotonic() - _deviation_start >= ALERT_SUSTAIN:
                     if not posture_bad:
                         posture_bad  = True
@@ -381,14 +469,17 @@ while True:
                         uart_println(uart, a)
                     uart_println(uart, "")
             else:
-                _deviation_start = None  # reset timer — posture recovered
+                _deviation_start = None
                 if posture_bad:
                     posture_bad = False
+                    haptic_off()
                     uart_println(uart, "--- POSTURE OK ---")
                     led_good()
 
         if posture_bad:
             led_alert_tick()
+            haptic_tick()
 
+    haptic_off()
     led_off()
     print("BLE disconnected. Re-advertising...")
